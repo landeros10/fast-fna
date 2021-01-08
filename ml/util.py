@@ -13,13 +13,6 @@ import logging
 from typing import List, Tuple
 
 
-def get_count(y):
-    y = tfa.image.connected_components(y == 1)
-    counts = tf.math.reduce_max(y, axis=(1, 2))
-    offsets = tf.concat([tf.constant([0]), counts[:-1]], axis=0)
-    return counts - offsets
-
-
 def make_weight_map(y_true: tf.Tensor,
                     n_class: int,
                     class_weights=None) -> tf.Tensor:
@@ -66,6 +59,18 @@ def make_batch_weights(y_true: tf.Tensor, p: float, limit: int = 200):
 
 
 def jaccard(y_true, logits, n_class, class_weights=None):
+    """Jaccard loss function.
+
+    Args:
+        y_true (type): Sparse ground truth tensor, shape (N, H, W).
+        logits (type): Logits tensor, shape (N, H, W, C).
+        n_class (type): Num class, C.
+        class_weights (type): Class weights, default None.
+
+    Returns:
+        type: tensorflow scalar.
+
+    """
     prediction = tf.one_hot(tf.math.argmax(logits, axis=-1), n_class)
     y_true = tf.one_hot(y_true, n_class, dtype=prediction.dtype)
 

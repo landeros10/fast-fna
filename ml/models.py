@@ -23,17 +23,28 @@ from tensorflow.keras.losses import SparseCategoricalCrossentropy, Reduction
 from tensorflow.keras.mixed_precision import experimental as mp
 from tensorflow.compat.v2.train import CheckpointManager
 
-from unet_inj.layers import (prelu, relu, tanh, conv2d, deconv2d,
-                             linear, avg_pool, max_pool,
-                             crop_concat, dapi_add, dapi_process, dropout_bn)
-from unet_inj.util import (make_weight_map, make_batch_weights, jaccard,
-                           cropto, combine_preds, save_image,
-                           augment, output_stats, _parse_function, get_count)
+from layers import (prelu, conv2d, deconv2d, max_pool,
+                    crop_concat, dapi_add, dapi_process, dropout_bn)
+from util import (make_weight_map, make_batch_weights, jaccard, cropto,
+                  combine_preds, save_image, augment, output_stats,
+                  _parse_function)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')
 
 
 class Custom_Model():
+    """Methods for defining models, setting up loss function, and training from
+    tensorflow DataSet object. Defaults to mixed floating point precision for
+    improved GPU usage.
+
+    Args:
+        channels (int): Number of input channels.
+        n_outputs (int): Number of outputs.
+        n_class (int): Number of classes in final output.
+        input_shape (Tuple): input shape in pixels.
+        net_kwargs (Dict): Hold parameters necessary for building network.
+        policy (str): Keras dtype policy. Defaults to "mixed_float16".
+    """
     __metaclass__ = abc.ABCMeta
 
     def __init__(self,
@@ -52,6 +63,7 @@ class Custom_Model():
         self.build_model(policy)
 
     def build_model(self, policy):
+        """Create Keras model and define loss function(s)"""
         if policy == "mixed_float16":
             self.policy = mp.Policy(policy)
             mp.set_policy(self.policy)
@@ -64,11 +76,13 @@ class Custom_Model():
     # Must be implemented in any Custom_Model object
     @abc.abstractmethod
     def define_model(self, input: tf.Tensor) -> tf.Tensor:
-        """Take input tensor, return logits tensor."""
+        """Take input tensor, return logits tensor.
+        Uses self.net_kwargs to define any hyperparameters."""
+        return input
 
     @abc.abstractmethod
     def define_loss(self):
-        """Store loss and accuracy functions. """
+        """Store loss and accuracy functions."""
         # Any funcs needed by self.eval_loss
         self.loss = lambda input, y_true, y_pred: None
 
@@ -82,7 +96,7 @@ class Custom_Model():
                   input: tf.Tensor,
                   y_true: tf.Tensor,
                   y_pred: tf.Tensor) -> tf.Tensor:
-        """Uses loss funcs defined in self.define_loss to return loss"""
+        """Evaluates loss functions defined in self.define_loss"""
         return self.loss(input, y_true, y_pred)
 
     def gen_checkpoint(self, optimizer):
@@ -94,9 +108,8 @@ class Custom_Model():
                                               max_to_keep=5)
 
     def restore(self, model_path):
-        """
-        Restores a session from a checkpoint
-        :param model_path: path to file system checkpoint location
+        """ Restores a session from checkpoint
+        model_path: path to file system checkpoint location
         """
         if not hasattr(self, "checkpoint"):
             self.ckpts = join(model_path, "saved_model")
@@ -109,31 +122,30 @@ class Custom_Model():
         logging.info("Model restored from file: %s" % model_path)
 
     def summary(self):
+        """ Summarizing function. Defaults to Keras model summary."""
         self.model.summary()
 
     @abc.abstractmethod
     def store_prediction(self, data, name: str):
-        """Creates predictions for a test batch. Saves images to file."""
+        """Creates prediction images for a test batch. Saves images to file."""
 
     def parse_train_params(self):
         """ Parse through training parameters. Descriptions below:
 
-            "bs"                e
-            "learning_rate"     e
-            "trn_data_len"      r
-            "trn_data_len"      e
-            "preFetch"          e
-            "epochs"            tre
-            "resize_lims"       [0.9, 1.0]
-            "noiseDev"          1e-4
-            "l2_norm"           0.1
-            "display_step"      1
-            "store_every"      e
+            "bs"                batch size
+            "learning_rate"     learning rate
+            "trn_data_len"      no. of examples in train dataset
+            "trn_data_len"      no. of examples in test dataset
+            "preFetch"          no. dataset elements to fetch ahead of time
+            "epochs"            training epochs
+            "resize_lims"       lower/upper resize bounds. Default [0.9, 1.0]
+            "noiseDev"          guassian noise stdev. Default 1e-4.
+            "l2_norm"           l2 regularization. Default 0.1.
+            "display_step"      number of steps between terminal outputs
+            "store_every"       number of epochs between prediction file saves
             "store_size"        number of samples to store in prediction images
             "store_resize_f"    factor for resizing prediction images
-            "num_losses"        e
-            "loss_names"        e
-            "bestAcc"           e
+            "bestAcc"           Min. accuracy required before checkpoint save.
         """
         self.bs = self.train_kwargs.get("bs", 16)
         self.lr = self.train_kwargs.get("learning_rate", 3e-6)
@@ -180,6 +192,7 @@ class Custom_Model():
         self.bestAcc = self.train_kwargs.get("bestAcc", 0)
 
     def store_kwargs(self, train_kwargs={}, loss_kwargs={}):
+        """ Saves key training and loss params at training time"""
         self.train_kwargs = train_kwargs
         self.parse_train_params()
         self.loss_kwargs = loss_kwargs
@@ -246,14 +259,13 @@ class Custom_Model():
             restore (bool): Restore previously trained model.
                 Must provide "out_path" in train_kwargs
         """
-        if self.epochs == 0:
-            return self.ckpts
-
+        # Use established strategy
         with self.strategy.scope():
             self.gen_checkpoint(self.optimizer)
             if restore:
                 self.restore(self.out_path)
 
+            # First, custom train ans test steps are defined
             def train_step(inputs):
                 images, labels = inputs
                 images, labels = augment(images, labels, self.rsl,
@@ -263,40 +275,26 @@ class Custom_Model():
                                          mean_p=self.mean_p)
                 with tf.GradientTape() as gt:
                     pred = self.model(images, training=True)
-                    if isinstance(pred, list):
-                        pred_shape = pred[-1].shape
-                        x = cropto(tf.split(images, 2, axis=3)[0], pred_shape)
-                    else:
-                        pred_shape = pred.shape
-                    labels = cropto(labels, pred_shape)
-                    loss = tf.reduce_sum(self.eval_loss(labels, pred, x)[0])
+                    labels = cropto(labels, pred.shape)
+                    loss = tf.reduce_sum(self.eval_loss(labels, pred))
                     sc_loss = self.optimizer.get_scaled_loss(loss)
                 sc_grads = gt.gradient(sc_loss, self.model.trainable_variables)
                 grads = self.optimizer.get_unscaled_gradients(sc_grads)
                 gradient_pairs = zip(grads, self.model.trainable_variables)
                 self.optimizer.apply_gradients(gradient_pairs)
-                if isinstance(pred, list):
-                    pred = pred[-1]
                 self.trn_acc.update_state(labels, pred)
                 return loss
 
             def test_step(inputs):
                 images, labels = inputs
                 pred = self.model(images, training=False)
-                if isinstance(pred, list):
-                    pred_shape = pred[-1].shape
-                    x = tf.split(images, 2, axis=3)[0]
-                else:
-                    pred_shape = pred.shape
-                labels = cropto(labels, pred_shape)
-                x = cropto(x, pred_shape)
-                t_loss, _ = self.eval_loss(labels, pred, x)
+                labels = cropto(labels, pred.shape)
+                t_loss = self.eval_loss(labels, pred)
                 self.tst_loss.update_state(tf.reduce_sum(t_loss))
-                if isinstance(pred, list):
-                    pred = pred[-1]
                 self.tst_acc.update_state(labels, pred)
                 return t_loss
 
+            # For use with tf MirroredStrategy
             @tf.function
             def dist_trn_step(data):
                 rep_loss = self.strategy.experimental_run_v2(train_step,
@@ -313,6 +311,7 @@ class Custom_Model():
                                             rep_loss, axis=None)
                 return loss
 
+        # Apply l2 regularization
         for layer in self.model.layers:
             if (isinstance(layer, tf.keras.layers.Conv2D) or
                     isinstance(layer, tf.keras.layers.Dense)):
@@ -328,6 +327,8 @@ class Custom_Model():
             logging.info("Epoch {}".format(epoch))
             total_loss = 0
             step = 0
+
+            # TRAIN
             with self.strategy.scope():
                 for batch in trn_dist:
                     loss = dist_trn_step(batch)
@@ -339,6 +340,7 @@ class Custom_Model():
                         break
             train_loss = total_loss / step
 
+            # TEST
             tst_loss = np.zeros((self.num_losses,))
             step = 0
             with self.strategy.scope():
@@ -352,6 +354,7 @@ class Custom_Model():
             test_loss = np.sum(tst_loss) / step
             test_acc = self.tst_acc.result() * 100
 
+            # LOG PROGRESS
             if epoch % self.store_every == 0:
                 self.store_prediction(next(iter(tst.take(1))),
                                       "epoch_{:03d}".format(epoch+1),
@@ -373,6 +376,7 @@ class Custom_Model():
             f.write(temp_format)
             f.close()
 
+            # UPDATE BEST ACCURACY
             if test_acc > self.bestAcc:
                 with self.strategy.scope():
                     self.ckpt_manager.save()
@@ -405,6 +409,8 @@ class Custom_Model():
 
 
 class Unet_Inj(Custom_Model):
+    """Modified UNET architecture. Introduces a second input (DAPI) at deeper
+    layers to improve segmentation."""
 
     def __init__(self,
                  n_class: int = 3,
@@ -542,7 +548,7 @@ class Unet_Inj(Custom_Model):
         loss = tf.nn.compute_average_loss(loss,
                                           sample_weight=batch_weights,
                                           global_batch_size=self.bs)
-        return loss, sample_weight
+        return loss
 
     def store_prediction(self, tst_batch, name, size=5):
         pred = self.model(tst_batch, training=False)
