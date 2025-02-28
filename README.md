@@ -1,4 +1,4 @@
-# Project Title
+# FAST-FNA
 
 A deep learning project for training and evaluating neural networks with custom data structures and 
 layers.
